@@ -44,55 +44,52 @@ export default function MusicPlayerScreen() {
   const playbackUpdateTimer = useRef<NodeJS.Timeout | null>(null);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
+  const loadAndPlaySongRef = useRef<((index: number) => Promise<void>) | null>(null);
 
   useEffect(() => {
     isMounted.current = true;
-    initializeApp();
     
-    // Entrance animation
+    const init = async () => {
+      try {
+        await setupAudio();
+        await loadPlaylist();
+      } catch (error) {
+        console.error('Initialization error:', error);
+        Alert.alert('Initialization Error', 'Failed to initialize the music player.');
+      }
+    };
+    
+    init();
+    
+    // Entrance animation - smoother timing
     Animated.parallel([
       Animated.timing(fadeAnim, {
         toValue: 1,
-        duration: 600,
+        duration: 800,
         useNativeDriver: true,
       }),
       Animated.spring(scaleAnim, {
         toValue: 1,
-        tension: 50,
-        friction: 7,
+        tension: 40,
+        friction: 8,
         useNativeDriver: true,
       }),
     ]).start();
 
     return () => {
       isMounted.current = false;
-      cleanup();
-    };
-  }, []);
-
-  const initializeApp = async () => {
-    try {
-      await setupAudio();
-      await loadPlaylist();
-    } catch (error) {
-      console.error('Initialization error:', error);
-      Alert.alert('Initialization Error', 'Failed to initialize the music player.');
-    }
-  };
-
-  const cleanup = async () => {
-    if (playbackUpdateTimer.current) {
-      clearInterval(playbackUpdateTimer.current);
-    }
-    if (sound) {
-      try {
-        await sound.stopAsync();
-        await sound.unloadAsync();
-      } catch (error) {
-        console.error('Cleanup error:', error);
+      const timer = playbackUpdateTimer.current;
+      const currentSound = sound;
+      
+      if (timer) {
+        clearInterval(timer);
       }
-    }
-  };
+      if (currentSound) {
+        currentSound.stopAsync().catch(() => {});
+        currentSound.unloadAsync().catch(() => {});
+      }
+    };
+  }, [fadeAnim, scaleAnim, sound]);
 
   const setupAudio = async () => {
     try {
@@ -135,7 +132,7 @@ export default function MusicPlayerScreen() {
       const result = await DocumentPicker.getDocumentAsync({ 
         type: 'audio/*',
         copyToCacheDirectory: true,
-        multiple: true, // Enable multiple file selection
+        multiple: true,
       });
       
       if (result.canceled) {
@@ -143,9 +140,8 @@ export default function MusicPlayerScreen() {
       }
 
       if (result.assets && result.assets.length > 0) {
-        // Process all selected files
         const newSongs: Song[] = result.assets.map((asset, index) => ({
-          id: Date.now() + index, // Ensure unique IDs
+          id: Date.now() + index,
           name: asset.name.replace(/\.[^/.]+$/, '') || 'Unknown Song',
           uri: asset.uri,
         }));
@@ -166,16 +162,55 @@ export default function MusicPlayerScreen() {
     }
   };
 
-  const loadAndPlaySong = async (index: number) => {
+  const animateSongChange = useCallback(() => {
+    Animated.sequence([
+      Animated.timing(scaleAnim, {
+        toValue: 0.96,
+        duration: 150,
+        useNativeDriver: true,
+      }),
+      Animated.spring(scaleAnim, {
+        toValue: 1,
+        tension: 40,
+        friction: 8,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [scaleAnim]);
+
+  const onPlaybackStatusUpdate = useCallback((status: AVPlaybackStatus) => {
+    if (!isMounted.current) return;
+    
+    if (status.isLoaded) {
+      setDuration(status.durationMillis || 0);
+      setPosition(status.positionMillis || 0);
+      setIsPlaying(status.isPlaying);
+
+      if (status.didJustFinish && !status.isLooping) {
+        // Use ref to avoid circular dependency
+        setTimeout(() => {
+          if (isMounted.current && loadAndPlaySongRef.current) {
+            const nextIndex = (currentSongIndex + 1) % playlist.length;
+            loadAndPlaySongRef.current(nextIndex);
+          }
+        }, 100);
+      }
+    } else if (status.error) {
+      console.error('Playback error:', status.error);
+      setIsPlaying(false);
+      Alert.alert('Playback Error', 'An error occurred during playback.');
+    }
+  }, [playlist.length, currentSongIndex]);
+
+  const loadAndPlaySong = useCallback(async (index: number) => {
     if (playlist.length === 0 || index < 0 || index >= playlist.length) {
       return;
     }
 
     try {
       setIsLoading(true);
-      animateSongChange(); // Trigger animation on song change
+      animateSongChange();
 
-      // Unload previous sound
       if (sound) {
         try {
           await sound.stopAsync();
@@ -186,7 +221,6 @@ export default function MusicPlayerScreen() {
         setSound(null);
       }
 
-      // Load new sound
       const { sound: newSound } = await Audio.Sound.createAsync(
         { uri: playlist[index].uri },
         { 
@@ -214,25 +248,12 @@ export default function MusicPlayerScreen() {
         setIsLoading(false);
       }
     }
-  };
+  }, [playlist, sound, onPlaybackStatusUpdate, animateSongChange]);
 
-  const onPlaybackStatusUpdate = useCallback((status: AVPlaybackStatus) => {
-    if (!isMounted.current) return;
-    
-    if (status.isLoaded) {
-      setDuration(status.durationMillis || 0);
-      setPosition(status.positionMillis || 0);
-      setIsPlaying(status.isPlaying);
-
-      if (status.didJustFinish && !status.isLooping) {
-        playNext();
-      }
-    } else if (status.error) {
-      console.error('Playback error:', status.error);
-      setIsPlaying(false);
-      Alert.alert('Playback Error', 'An error occurred during playback.');
-    }
-  }, []);
+  // Store the latest loadAndPlaySong in ref
+  useEffect(() => {
+    loadAndPlaySongRef.current = loadAndPlaySong;
+  }, [loadAndPlaySong]);
 
   const togglePlayPause = async () => {
     if (!sound) {
@@ -260,7 +281,7 @@ export default function MusicPlayerScreen() {
     if (playlist.length === 0) return;
     const nextIndex = (currentSongIndex + 1) % playlist.length;
     loadAndPlaySong(nextIndex);
-  }, [playlist.length, currentSongIndex]);
+  }, [playlist.length, currentSongIndex, loadAndPlaySong]);
 
   const playPrevious = async () => {
     if (playlist.length === 0) return;
@@ -283,7 +304,7 @@ export default function MusicPlayerScreen() {
     }
   };
 
-  const removeSong = async (id: number) => {
+  const removeSong = useCallback(async (id: number) => {
     Alert.alert(
       'Remove Song',
       'Are you sure you want to remove this song from your playlist?',
@@ -297,7 +318,6 @@ export default function MusicPlayerScreen() {
             setPlaylist(updatedPlaylist);
             await savePlaylist(updatedPlaylist);
             
-            // If currently playing song is removed
             const removedIndex = playlist.findIndex(song => song.id === id);
             if (removedIndex === currentSongIndex && sound) {
               await sound.stopAsync();
@@ -314,7 +334,7 @@ export default function MusicPlayerScreen() {
         },
       ]
     );
-  };
+  }, [playlist, currentSongIndex, sound]);
 
   const formatTime = (millis: number) => {
     const totalSeconds = Math.floor(millis / 1000);
@@ -323,50 +343,28 @@ export default function MusicPlayerScreen() {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  const miniPlayerHeight = scrollY.interpolate({
-    inputRange: [0, 100],
-    outputRange: [80, 50],
-    extrapolate: 'clamp',
-  });
-
   const miniPlayerOpacity = scrollY.interpolate({
-    inputRange: [0, 50],
-    outputRange: [1, 0.95],
+    inputRange: [0, 100],
+    outputRange: [1, 0.9],
     extrapolate: 'clamp',
   });
 
-  const animateSongChange = () => {
-    Animated.sequence([
-      Animated.timing(scaleAnim, {
-        toValue: 0.95,
-        duration: 100,
-        useNativeDriver: true,
-      }),
-      Animated.spring(scaleAnim, {
-        toValue: 1,
-        tension: 50,
-        friction: 7,
-        useNativeDriver: true,
-      }),
-    ]).start();
-  };
-
-  const renderSongItem = ({ item, index }: { item: Song; index: number }) => {
+  const renderSongItem = useCallback(({ item, index }: { item: Song; index: number }) => {
     const inputRange = [
-      (index - 1) * 72,
-      index * 72,
-      (index + 1) * 72,
+      (index - 1) * 80,
+      index * 80,
+      (index + 1) * 80,
     ];
     
     const scale = scrollY.interpolate({
       inputRange,
-      outputRange: [1, 1, 0.95],
+      outputRange: [0.98, 1, 0.98],
       extrapolate: 'clamp',
     });
     
     const opacity = scrollY.interpolate({
       inputRange,
-      outputRange: [1, 1, 0.5],
+      outputRange: [0.7, 1, 0.7],
       extrapolate: 'clamp',
     });
 
@@ -395,14 +393,14 @@ export default function MusicPlayerScreen() {
         </TouchableOpacity>
       </Animated.View>
     );
-  };
+  }, [scrollY, currentSongIndex, isPlaying, loadAndPlaySong, removeSong]);
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#121212" />
       
       <Animated.View style={[styles.header, { opacity: fadeAnim, transform: [{ scale: scaleAnim }] }]}>
-        <Text style={styles.headerTitle}>My Music</Text>
+        <Text style={styles.headerTitle}>Deeptune</Text>
         <Text style={styles.headerSubtitle}>{playlist.length} songs</Text>
       </Animated.View>
 
@@ -423,6 +421,15 @@ export default function MusicPlayerScreen() {
             { useNativeDriver: true }
           )}
           scrollEventThrottle={16}
+          removeClippedSubviews={true}
+          maxToRenderPerBatch={10}
+          windowSize={10}
+          initialNumToRender={10}
+          getItemLayout={(data, index) => ({
+            length: 80,
+            offset: 80 * index,
+            index,
+          })}
         />
       )}
 
@@ -431,7 +438,6 @@ export default function MusicPlayerScreen() {
         <Animated.View style={[
           styles.miniPlayerContainer, 
           { 
-            height: miniPlayerHeight,
             opacity: miniPlayerOpacity,
             transform: [{ scale: scaleAnim }]
           }
@@ -602,6 +608,7 @@ const styles = StyleSheet.create({
     marginHorizontal: 12,
     marginVertical: 4,
     borderRadius: 8,
+    height: 72,
   },
   activeSongItem: { 
     backgroundColor: '#282828',
