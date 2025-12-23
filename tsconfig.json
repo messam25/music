@@ -1,11 +1,11 @@
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
+    "skipLibCheck": true,        // ✅ prevents errors from node_modules
     "strict": true,
+    "baseUrl": ".",              // 🔹 ensures paths like @/components work
     "paths": {
-      "@/*": [
-        "./*"
-      ]
+      "@/*": ["./*"]             // ✅ alias for imports
     }
   },
   "include": [
