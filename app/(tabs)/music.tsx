@@ -8,7 +8,6 @@ import {
     ActivityIndicator,
     Alert,
     Animated,
-    FlatList,
     Modal,
     SafeAreaView,
     StatusBar,
@@ -26,6 +25,7 @@ interface Song {
 }
 
 const STORAGE_KEY = '@musicPlaylist_v1';
+const PLAYBACK_UPDATE_INTERVAL = 100;
 
 export default function MusicPlayerScreen() {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
@@ -41,19 +41,10 @@ export default function MusicPlayerScreen() {
 
   const scrollY = useRef(new Animated.Value(0)).current;
   const isMounted = useRef(true);
+  const playbackUpdateTimer = useRef<NodeJS.Timeout | null>(null);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
-  const playlistRef = useRef<Song[]>([]);
-  const currentIndexRef = useRef(0);
-
-  // Update refs when state changes
-  useEffect(() => {
-    playlistRef.current = playlist;
-  }, [playlist]);
-
-  useEffect(() => {
-    currentIndexRef.current = currentSongIndex;
-  }, [currentSongIndex]);
+  const loadAndPlaySongRef = useRef<((index: number) => Promise<void>) | null>(null);
 
   useEffect(() => {
     isMounted.current = true;
@@ -70,6 +61,7 @@ export default function MusicPlayerScreen() {
     
     init();
     
+    // Entrance animation - smoother timing
     Animated.parallel([
       Animated.timing(fadeAnim, {
         toValue: 1,
@@ -86,12 +78,18 @@ export default function MusicPlayerScreen() {
 
     return () => {
       isMounted.current = false;
-      if (sound) {
-        sound.stopAsync().catch(() => {});
-        sound.unloadAsync().catch(() => {});
+      const timer = playbackUpdateTimer.current;
+      const currentSound = sound;
+      
+      if (timer) {
+        clearInterval(timer);
+      }
+      if (currentSound) {
+        currentSound.stopAsync().catch(() => {});
+        currentSound.unloadAsync().catch(() => {});
       }
     };
-  }, []);
+  }, [fadeAnim, scaleAnim, sound]);
 
   const setupAudio = async () => {
     try {
@@ -113,7 +111,6 @@ export default function MusicPlayerScreen() {
       if (saved && isMounted.current) {
         const parsedPlaylist = JSON.parse(saved);
         setPlaylist(parsedPlaylist);
-        playlistRef.current = parsedPlaylist;
       }
     } catch (error) {
       console.error('Load playlist error:', error);
@@ -151,7 +148,6 @@ export default function MusicPlayerScreen() {
         
         const updatedPlaylist = [...playlist, ...newSongs];
         setPlaylist(updatedPlaylist);
-        playlistRef.current = updatedPlaylist;
         await savePlaylist(updatedPlaylist);
         
         const songCount = newSongs.length;
@@ -182,8 +178,7 @@ export default function MusicPlayerScreen() {
     ]).start();
   }, [scaleAnim]);
 
-  // Stable callback using refs
-  const handlePlaybackStatusUpdate = useCallback((status: AVPlaybackStatus) => {
+  const onPlaybackStatusUpdate = useCallback((status: AVPlaybackStatus) => {
     if (!isMounted.current) return;
     
     if (status.isLoaded) {
@@ -192,29 +187,23 @@ export default function MusicPlayerScreen() {
       setIsPlaying(status.isPlaying);
 
       if (status.didJustFinish && !status.isLooping) {
-        // Use refs to avoid dependency on state
-        const currentPlaylist = playlistRef.current;
-        const currentIdx = currentIndexRef.current;
-        
-        if (currentPlaylist.length > 0) {
-          const nextIndex = (currentIdx + 1) % currentPlaylist.length;
-          // Use setTimeout to break out of the callback
-          setTimeout(() => {
-            loadAndPlaySong(nextIndex);
-          }, 100);
-        }
+        // Use ref to avoid circular dependency
+        setTimeout(() => {
+          if (isMounted.current && loadAndPlaySongRef.current) {
+            const nextIndex = (currentSongIndex + 1) % playlist.length;
+            loadAndPlaySongRef.current(nextIndex);
+          }
+        }, 100);
       }
     } else if (status.error) {
       console.error('Playback error:', status.error);
       setIsPlaying(false);
       Alert.alert('Playback Error', 'An error occurred during playback.');
     }
-  }, []); // No dependencies - stable callback
+  }, [playlist.length, currentSongIndex]);
 
   const loadAndPlaySong = useCallback(async (index: number) => {
-    const currentPlaylist = playlistRef.current;
-    
-    if (currentPlaylist.length === 0 || index < 0 || index >= currentPlaylist.length) {
+    if (playlist.length === 0 || index < 0 || index >= playlist.length) {
       return;
     }
 
@@ -222,10 +211,8 @@ export default function MusicPlayerScreen() {
       setIsLoading(true);
       animateSongChange();
 
-      // Unload previous sound
       if (sound) {
         try {
-          await sound.setOnPlaybackStatusUpdate(null);
           await sound.stopAsync();
           await sound.unloadAsync();
         } catch (e) {
@@ -234,24 +221,19 @@ export default function MusicPlayerScreen() {
         setSound(null);
       }
 
-      console.log('Loading song:', currentPlaylist[index].name);
-
-      // Load and play new sound
       const { sound: newSound } = await Audio.Sound.createAsync(
-        { uri: currentPlaylist[index].uri },
+        { uri: playlist[index].uri },
         { 
           shouldPlay: true,
-          progressUpdateIntervalMillis: 100,
+          progressUpdateIntervalMillis: PLAYBACK_UPDATE_INTERVAL,
         },
-        handlePlaybackStatusUpdate // Pass callback during creation
+        onPlaybackStatusUpdate
       );
 
       if (isMounted.current) {
         setSound(newSound);
         setCurrentSongIndex(index);
-        currentIndexRef.current = index;
         setIsPlaying(true);
-        console.log('Song loaded successfully');
       } else {
         await newSound.unloadAsync();
       }
@@ -259,14 +241,19 @@ export default function MusicPlayerScreen() {
       console.error('Load song error:', error);
       Alert.alert(
         'Playback Error', 
-        `Failed to play "${currentPlaylist[index].name}". The file may be corrupted or in an unsupported format.`
+        `Failed to play "${playlist[index].name}". The file may be corrupted or in an unsupported format.`
       );
     } finally {
       if (isMounted.current) {
         setIsLoading(false);
       }
     }
-  }, [sound, animateSongChange, handlePlaybackStatusUpdate]);
+  }, [playlist, sound, onPlaybackStatusUpdate, animateSongChange]);
+
+  // Store the latest loadAndPlaySong in ref
+  useEffect(() => {
+    loadAndPlaySongRef.current = loadAndPlaySong;
+  }, [loadAndPlaySong]);
 
   const togglePlayPause = async () => {
     if (!sound) {
@@ -279,13 +266,10 @@ export default function MusicPlayerScreen() {
     }
 
     try {
-      const status = await sound.getStatusAsync();
-      if (status.isLoaded) {
-        if (status.isPlaying) {
-          await sound.pauseAsync();
-        } else {
-          await sound.playAsync();
-        }
+      if (isPlaying) {
+        await sound.pauseAsync();
+      } else {
+        await sound.playAsync();
       }
     } catch (error) {
       console.error('Toggle play/pause error:', error);
@@ -332,7 +316,6 @@ export default function MusicPlayerScreen() {
           onPress: async () => {
             const updatedPlaylist = playlist.filter(song => song.id !== id);
             setPlaylist(updatedPlaylist);
-            playlistRef.current = updatedPlaylist;
             await savePlaylist(updatedPlaylist);
             
             const removedIndex = playlist.findIndex(song => song.id === id);
@@ -345,7 +328,6 @@ export default function MusicPlayerScreen() {
               if (updatedPlaylist.length > 0) {
                 const newIndex = Math.min(currentSongIndex, updatedPlaylist.length - 1);
                 setCurrentSongIndex(newIndex);
-                currentIndexRef.current = newIndex;
               }
             }
           },
@@ -418,7 +400,7 @@ export default function MusicPlayerScreen() {
       <StatusBar barStyle="light-content" backgroundColor="#121212" />
       
       <Animated.View style={[styles.header, { opacity: fadeAnim, transform: [{ scale: scaleAnim }] }]}>
-        <Text style={styles.headerTitle}>Deeptune</Text>
+        <Text style={styles.headerTitle}>Deept</Text>
         <Text style={styles.headerSubtitle}>{playlist.length} songs</Text>
       </Animated.View>
 
@@ -429,15 +411,25 @@ export default function MusicPlayerScreen() {
           <Text style={styles.emptySubtext}>Tap the + button to add songs</Text>
         </Animated.View>
       ) : (
-        <FlatList
+        <Animated.FlatList
           data={playlist}
           renderItem={renderSongItem}
           keyExtractor={(item) => item.id.toString()}
           contentContainerStyle={styles.listContent}
-          removeClippedSubviews={false}
+          onScroll={Animated.event(
+            [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+            { useNativeDriver: true }
+          )}
+          scrollEventThrottle={16}
+          removeClippedSubviews={true}
           maxToRenderPerBatch={10}
           windowSize={10}
           initialNumToRender={10}
+          getItemLayout={(data, index) => ({
+            length: 80,
+            offset: 80 * index,
+            index,
+          })}
         />
       )}
 
