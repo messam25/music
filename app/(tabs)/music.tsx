@@ -3,19 +3,22 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+
+const MUSIC_DIR = `${FileSystem.cacheDirectory}music/`;
 import {
     ActivityIndicator,
     Alert,
     Animated,
     Modal,
-    SafeAreaView,
     StatusBar,
     StyleSheet,
     Text,
     TouchableOpacity,
     View
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 interface Song {
   id: number;
@@ -41,7 +44,6 @@ export default function MusicPlayerScreen() {
 
   const scrollY = useRef(new Animated.Value(0)).current;
   const isMounted = useRef(true);
-  const playbackUpdateTimer = useRef<NodeJS.Timeout | null>(null);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
   const loadAndPlaySongRef = useRef<((index: number) => Promise<void>) | null>(null);
@@ -52,6 +54,7 @@ export default function MusicPlayerScreen() {
     const init = async () => {
       try {
         await setupAudio();
+        await ensureMusicDirectory();
         await loadPlaylist();
       } catch (error) {
         console.error('Initialization error:', error);
@@ -61,7 +64,7 @@ export default function MusicPlayerScreen() {
     
     init();
     
-    // Entrance animation - smoother timing
+    // Entrance animation
     Animated.parallel([
       Animated.timing(fadeAnim, {
         toValue: 1,
@@ -78,18 +81,31 @@ export default function MusicPlayerScreen() {
 
     return () => {
       isMounted.current = false;
-      const timer = playbackUpdateTimer.current;
-      const currentSound = sound;
       
-      if (timer) {
-        clearInterval(timer);
-      }
-      if (currentSound) {
-        currentSound.stopAsync().catch(() => {});
-        currentSound.unloadAsync().catch(() => {});
-      }
+      const cleanup = async () => {
+        if (sound) {
+          try {
+            await sound.stopAsync();
+            await sound.unloadAsync();
+          } catch {
+            // Ignore cleanup errors
+          }
+        }
+      };
+      cleanup();
     };
   }, [fadeAnim, scaleAnim, sound]);
+
+  const ensureMusicDirectory = async () => {
+    try {
+      const dirInfo = await FileSystem.getInfoAsync(MUSIC_DIR);
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(MUSIC_DIR, { intermediates: true });
+      }
+    } catch (error) {
+      console.error('Error creating music directory:', error);
+    }
+  };
 
   const setupAudio = async () => {
     try {
@@ -110,11 +126,42 @@ export default function MusicPlayerScreen() {
       const saved = await AsyncStorage.getItem(STORAGE_KEY);
       if (saved && isMounted.current) {
         const parsedPlaylist = JSON.parse(saved);
-        setPlaylist(parsedPlaylist);
+        
+        // Verify files still exist and filter out cache URIs
+        const validSongs: Song[] = [];
+        for (const song of parsedPlaylist) {
+          // Skip songs from cache directory (old temporary files)
+          if (song.uri.includes('/cache/') || song.uri.includes('DocumentPicker')) {
+            console.log('Removing cached song:', song.name);
+            continue;
+          }
+          
+          const fileInfo = await FileSystem.getInfoAsync(song.uri);
+          if (fileInfo.exists) {
+            validSongs.push(song);
+          } else {
+            console.log('File not found:', song.name);
+          }
+        }
+        
+        setPlaylist(validSongs);
+        
+        // Update storage - always update to clean out old songs
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(validSongs));
+        
+        if (validSongs.length === 0 && parsedPlaylist.length > 0) {
+          Alert.alert(
+            'Playlist Cleaned',
+            'Old temporary files were removed. Please add your music again.',
+            [{ text: 'OK' }]
+          );
+        }
       }
     } catch (error) {
       console.error('Load playlist error:', error);
-      Alert.alert('Error', 'Failed to load your playlist.');
+      // If there's an error parsing, clear the storage
+      await AsyncStorage.removeItem(STORAGE_KEY);
+      Alert.alert('Error', 'Playlist data was corrupted and has been reset. Please add your music again.');
     }
   };
 
@@ -131,7 +178,7 @@ export default function MusicPlayerScreen() {
     try {
       const result = await DocumentPicker.getDocumentAsync({ 
         type: 'audio/*',
-        copyToCacheDirectory: true,
+        copyToCacheDirectory: false,
         multiple: true,
       });
       
@@ -140,21 +187,39 @@ export default function MusicPlayerScreen() {
       }
 
       if (result.assets && result.assets.length > 0) {
-        const newSongs: Song[] = result.assets.map((asset, index) => ({
-          id: Date.now() + index,
-          name: asset.name.replace(/\.[^/.]+$/, '') || 'Unknown Song',
-          uri: asset.uri,
-        }));
+        const newSongs: Song[] = [];
         
-        const updatedPlaylist = [...playlist, ...newSongs];
-        setPlaylist(updatedPlaylist);
-        await savePlaylist(updatedPlaylist);
+        for (let i = 0; i < result.assets.length; i++) {
+          const asset = result.assets[i];
+          const fileName = `${Date.now()}_${i}_${asset.name}`;
+          const newUri = `${MUSIC_DIR}${fileName}`;
+          
+          try {
+            await FileSystem.copyAsync({
+              from: asset.uri,
+              to: newUri,
+            });
+            
+            newSongs.push({
+              id: Date.now() + i,
+              name: asset.name.replace(/\.[^/.]+$/, '') || 'Unknown Song',
+              uri: newUri,
+            });
+          } catch (copyError) {
+            console.error('Error copying file:', copyError);
+          }
+        }
         
-        const songCount = newSongs.length;
-        Alert.alert(
-          'Success', 
-          `Added ${songCount} song${songCount > 1 ? 's' : ''} to your playlist`
-        );
+        if (newSongs.length > 0) {
+          const updatedPlaylist = [...playlist, ...newSongs];
+          setPlaylist(updatedPlaylist);
+          await savePlaylist(updatedPlaylist);
+          
+          Alert.alert(
+            'Success', 
+            `Added ${newSongs.length} song${newSongs.length > 1 ? 's' : ''} to your playlist`
+          );
+        }
       }
     } catch (error) {
       console.error('Pick files error:', error);
@@ -187,7 +252,6 @@ export default function MusicPlayerScreen() {
       setIsPlaying(status.isPlaying);
 
       if (status.didJustFinish && !status.isLooping) {
-        // Use ref to avoid circular dependency
         setTimeout(() => {
           if (isMounted.current && loadAndPlaySongRef.current) {
             const nextIndex = (currentSongIndex + 1) % playlist.length;
@@ -221,8 +285,18 @@ export default function MusicPlayerScreen() {
         setSound(null);
       }
 
+      const songUri = playlist[index].uri;
+      
+      // Verify file exists
+      const fileInfo = await FileSystem.getInfoAsync(songUri);
+      if (!fileInfo.exists) {
+        throw new Error('Song file not found');
+      }
+
+      console.log('Loading song:', playlist[index].name);
+
       const { sound: newSound } = await Audio.Sound.createAsync(
-        { uri: playlist[index].uri },
+        { uri: songUri },
         { 
           shouldPlay: true,
           progressUpdateIntervalMillis: PLAYBACK_UPDATE_INTERVAL,
@@ -250,7 +324,6 @@ export default function MusicPlayerScreen() {
     }
   }, [playlist, sound, onPlaybackStatusUpdate, animateSongChange]);
 
-  // Store the latest loadAndPlaySong in ref
   useEffect(() => {
     loadAndPlaySongRef.current = loadAndPlaySong;
   }, [loadAndPlaySong]);
@@ -304,6 +377,45 @@ export default function MusicPlayerScreen() {
     }
   };
 
+  const clearPlaylist = async () => {
+    Alert.alert(
+      'Clear Playlist',
+      'This will remove all songs from your playlist. Are you sure?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear All',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              if (sound) {
+                await sound.stopAsync();
+                await sound.unloadAsync();
+                setSound(null);
+              }
+              
+              const dirInfo = await FileSystem.getInfoAsync(MUSIC_DIR);
+              if (dirInfo.exists) {
+                await FileSystem.deleteAsync(MUSIC_DIR, { idempotent: true });
+                await FileSystem.makeDirectoryAsync(MUSIC_DIR, { intermediates: true });
+              }
+              
+              setPlaylist([]);
+              setCurrentSongIndex(0);
+              setIsPlaying(false);
+              await AsyncStorage.removeItem(STORAGE_KEY);
+              
+              Alert.alert('Success', 'Playlist cleared');
+            } catch (error) {
+              console.error('Clear playlist error:', error);
+              Alert.alert('Error', 'Failed to clear playlist');
+            }
+          },
+        },
+      ]
+    );
+  };
+
   const removeSong = useCallback(async (id: number) => {
     Alert.alert(
       'Remove Song',
@@ -314,9 +426,19 @@ export default function MusicPlayerScreen() {
           text: 'Remove',
           style: 'destructive',
           onPress: async () => {
+            const songToRemove = playlist.find(song => song.id === id);
             const updatedPlaylist = playlist.filter(song => song.id !== id);
             setPlaylist(updatedPlaylist);
             await savePlaylist(updatedPlaylist);
+            
+            // Delete the file
+            if (songToRemove) {
+              try {
+                await FileSystem.deleteAsync(songToRemove.uri, { idempotent: true });
+              } catch (error) {
+                console.error('Error deleting file:', error);
+              }
+            }
             
             const removedIndex = playlist.findIndex(song => song.id === id);
             if (removedIndex === currentSongIndex && sound) {
@@ -400,8 +522,17 @@ export default function MusicPlayerScreen() {
       <StatusBar barStyle="light-content" backgroundColor="#121212" />
       
       <Animated.View style={[styles.header, { opacity: fadeAnim, transform: [{ scale: scaleAnim }] }]}>
-        <Text style={styles.headerTitle}>Deept</Text>
-        <Text style={styles.headerSubtitle}>{playlist.length} songs</Text>
+        <View style={styles.headerTop}>
+          <View>
+            <Text style={styles.headerTitle}>Deept</Text>
+            <Text style={styles.headerSubtitle}>{playlist.length} songs</Text>
+          </View>
+          {playlist.length > 0 && (
+            <TouchableOpacity onPress={clearPlaylist} style={styles.clearButton}>
+              <Ionicons name="trash-outline" size={24} color="#ff4444" />
+            </TouchableOpacity>
+          )}
+        </View>
       </Animated.View>
 
       {playlist.length === 0 ? (
@@ -571,6 +702,11 @@ const styles = StyleSheet.create({
     paddingTop: 20,
     paddingBottom: 16,
   },
+  headerTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
   headerTitle: {
     fontSize: 32,
     fontWeight: '700',
@@ -580,6 +716,9 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
     marginTop: 4,
+  },
+  clearButton: {
+    padding: 8,
   },
   emptyState: { 
     flex: 1, 
